@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+
+from argparse import (
+    Namespace,
+)
+from configparser import (
+    ConfigParser,
+)
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+)
+from urllib.parse import (
+    urlparse,
+)
+
+
+CLICommand = Callable[[Namespace], bool]
+
+
+class AuthenticationError(Exception):
+    pass
+
+
+def cfg_path() -> pathlib.Path:
+    if '1P_CONFIG' in os.environ:
+        return pathlib.Path(os.environ['1P_CONFIG'])
+    try:
+        cfg_home = pathlib.Path(os.environ['XDG_CONFIG_HOME'])
+    except KeyError:
+        home = pathlib.Path(os.environ['HOME'])
+        cfg_home = home / '.config'
+    return cfg_home / '1p' / 'config'
+
+
+def read_cfg() -> ConfigParser:
+    cp = cfg_path()
+    if not os.path.exists(cp):
+        return ConfigParser()
+    with open(cp, 'r') as cf:
+        config = ConfigParser()
+        config.read_file(cf)
+        return config
+
+
+def write_cfg(cfg: ConfigParser):
+    cp = cfg_path()
+    os.makedirs(os.path.dirname(str(cp)), exist_ok=True)
+    with open(cp, 'w') as cf:
+        cfg.write(cf)
+        os.fchmod(cf.fileno(), 0o0600)
+
+
+class Commands(object):
+    registry: Dict[str, CLICommand]
+
+    def __init__(self):
+        self.registry = {}
+
+    def cmds(self) -> Tuple[str, ...]:
+        return tuple(self.registry.keys())
+
+    def add(self, name: str) -> Callable[[CLICommand], CLICommand]:
+        def wrapped(fn: CLICommand) -> CLICommand:
+            self.registry[name] = fn
+            return fn
+        return wrapped
+
+    def run(self, name: str, args: Namespace) -> bool:
+        return self.registry[name](args)
+
+
+cmds = Commands()
+
+
+@cmds.add('update')
+def update(args: Namespace) -> bool:
+    ret, _ = op((
+        'update',
+    ))
+    if ret != 0:
+        return False
+    return True
+
+
+@cmds.add('init')
+def init(args: Namespace) -> bool:
+    uri = input('account name [foo.1password.com]: ')
+    email = input('email [bar@foo.test]: ')
+    secret = input('secret key [A3-XXXXXX-XXXXXX...]: ')
+
+    copy_cmd = input('clipboard copy command [xsel -ibk]: ')
+
+    cfg = read_cfg()
+    cfg['auth'] = {
+        'uri': uri,
+        'email': email,
+        'secret': secret,
+    }
+    cfg['env'] = {
+        'copy_cmd': copy_cmd,
+    }
+    write_cfg(cfg)
+
+    return True
+
+
+def authenticate():
+    cfg = read_cfg()
+    now = time.time()
+    acc_id = cfg['auth']['uri'].replace('.1password.com', '')
+
+    try:
+        if 0 <= now - cfg['session'].getfloat('time') < 25 * 60:
+            os.environ[f'OP_SESSION_{acc_id}'] = cfg['session']['id']
+            return
+    except KeyError:
+        pass
+
+    ret, out = op(
+        (
+            'signin',
+            '--output=raw',
+            cfg['auth']['uri'],
+            cfg['auth']['email'],
+            cfg['auth']['secret'],
+        ),
+        stdout=True,
+    )
+    if ret != 0:
+        raise AuthenticationError
+    session = out.strip()
+    cfg['session'] = {}
+    cfg['session']['time'] = str(now)
+    cfg['session']['id'] = session
+    os.environ[f'OP_SESSION_{acc_id}'] = session
+    write_cfg(cfg)
+
+
+def list_accounts() -> List[Dict[str, Any]]:
+    authenticate()
+    ret, out = op(('list', 'items'), stdout=True)
+    if out is None:
+        return []
+    items = json.loads(out)
+    return items
+
+
+@cmds.add('list')
+def list(args: Namespace) -> bool:
+    items = sorted(list_accounts(), key=lambda it: it['overview']['title'])
+    for item in items:
+        title = item['overview']['title']
+        urls = map(lambda x: urlparse(x['u']).hostname, item['overview'].get('URLs', []))
+        account = item['overview'].get('ainfo', '')
+        print(f'{title}: {account} [{",".join(urls)}]')
+    return True
+
+
+@cmds.add('grep')
+def grep(args: Namespace) -> bool:
+    pattern = re.compile(args.args[0], re.IGNORECASE)
+    items = sorted(
+        filter(
+            lambda it: pattern.search(it['overview']['title']),
+            list_accounts(),
+        ),
+        key=lambda it: it['overview']['title'],
+    )
+    for item in items:
+        title = item['overview']['title']
+        urls = map(lambda x: urlparse(x['u']).hostname, item['overview'].get('URLs', []))
+        account = item['overview'].get('ainfo', '')
+        print(f'{title}: {account} [{",".join(urls)}]')
+    return True
+
+
+def get_password(args: Namespace) -> Optional[str]:
+    authenticate()
+    ret, out = op(
+        ('get', 'item', ' '.join(args.args)),
+        stdout=True,
+    )
+    if out is None:
+        return None
+    item = json.loads(out)
+    try:
+        for field in item['details']['fields']:
+            try:
+                if field['designation'] == 'password':
+                    return field['value']
+            except KeyError:
+                continue
+    except KeyError:
+        pass
+    return None
+
+
+@cmds.add('get')
+def get(args: Namespace) -> bool:
+    passwd = get_password(args)
+    if passwd is None:
+        return False
+    print(passwd)
+    return True
+
+
+@cmds.add('cp')
+def cp(args: Namespace) -> bool:
+    passwd = get_password(args)
+    if passwd is None:
+        return False
+    cfg = read_cfg()
+    try:
+        copy_cmd = cfg['env']['copy_cmd'].split()
+    except KeyError:
+        print('[env].copy_cmd is not set', file=sys.stderr)
+        return False
+    rc = subprocess.run(copy_cmd, input=passwd.encode('utf-8'))
+    if rc == 0:
+        return True
+    return False
+
+
+@cmds.add('cat')
+def cat(args: Namespace) -> bool:
+    authenticate()
+    ret, out = op(
+        ('get', 'item', ' '.join(args.args)),
+        stdout=True,
+    )
+    print(out)
+    return True
+
+
+@cmds.add('clear')
+def clear(args: Namespace) -> bool:
+    cfg = read_cfg()
+    try:
+        copy_cmd = cfg['env']['copy_cmd'].split()
+    except KeyError:
+        print('[env].copy_cmd is not set', file=sys.stderr)
+        return False
+    rc = subprocess.run(copy_cmd, input=b'')
+    if rc == 0:
+        return True
+    return False
+
+
+def op(cmd: Iterable[str], stdin: Optional[str] = None, stdout: bool = False) -> Tuple[int, Optional[str]]:
+    if stdout:
+        out = subprocess.PIPE
+    else:
+        out = None
+    if stdin:
+        stdin_b = stdin.encode('utf-8')
+    else:
+        stdin_b = b''
+    proc = subprocess.run(
+        ('op', *cmd),
+        input=stdin_b,
+        stdout=out,
+    )
+    rc = proc.returncode
+    out = proc.stdout
+    if out:
+        out = out.decode('utf-8')
+    return rc, out
+
+
+def get_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('command', choices=cmds.cmds(), help='command to run')
+    parser.add_argument('args', nargs='*', help='arguments to command')
+
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = get_args()
+    try:
+        ok = cmds.run(args.command, args)
+    except AuthenticationError:
+        ok = False
+        print('authentication error', file=sys.stderr)
+    if ok:
+        return 0
+    else:
+        return 1
+
+
+if __name__ == '__main__':
+    ret = main()
+    sys.exit(ret)
