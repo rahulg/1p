@@ -261,18 +261,14 @@ def clear(args: Namespace) -> bool:
 
 
 def op(cmd: Iterable[str], stdin: Optional[str] = None, stdout: bool = False) -> Tuple[int, Optional[str]]:
+    args = {}
     if stdout:
-        out = subprocess.PIPE
-    else:
-        out = None
+        args['stdout'] = subprocess.PIPE
     if stdin:
-        stdin_b = stdin.encode('utf-8')
-    else:
-        stdin_b = b''
+        args['input'] = stdin.encode('utf-8')
     proc = subprocess.run(
         ('op', *cmd),
-        input=stdin_b,
-        stdout=out,
+        **args,
     )
     rc = proc.returncode
     out = proc.stdout
