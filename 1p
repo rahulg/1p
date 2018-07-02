@@ -48,7 +48,7 @@ def cfg_path() -> pathlib.Path:
 
 def read_cfg() -> ConfigParser:
     cp = cfg_path()
-    if not os.path.exists(cp):
+    if not cp.exists():
         return ConfigParser()
     with open(cp, 'r') as cf:
         config = ConfigParser()
@@ -58,7 +58,7 @@ def read_cfg() -> ConfigParser:
 
 def write_cfg(cfg: ConfigParser):
     cp = cfg_path()
-    os.makedirs(os.path.dirname(str(cp)), exist_ok=True)
+    os.makedirs(cp.parent, exist_ok=True)
     with open(cp, 'w') as cf:
         cfg.write(cf)
         os.fchmod(cf.fileno(), 0o0600)
